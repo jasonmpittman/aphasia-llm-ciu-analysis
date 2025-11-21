@@ -1,3 +1,4 @@
+models
 ._*
 
 ## Mac
@@ -7,7 +8,6 @@
 *.epub
 *.mobi
 *.pdf
-*.docx
 *.dox
 
 ## Intermediate figures
