@@ -8,21 +8,23 @@ __maintainer__ = "Jason M. Pittman"
 __status__ = "Research"
 
 from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import typer
 from jinja2 import Template
 from tqdm import tqdm
 
-from utils import Config, save_json, set_global_seed
+from utils import Config, save_json, set_global_seed, get_model_config
 
 app = typer.Typer(add_completion=False)
 
 
 def load_prompts_yaml(path: Path) -> Dict[str, str]:
     import yaml
+
     with path.open("r") as f:
         data = yaml.safe_load(f)
     system = data["system"]
@@ -34,32 +36,64 @@ def build_token_block(tokens: List[str]) -> str:
     return "\n".join(f"{i}: {tok}" for i, tok in enumerate(tokens))
 
 
-def load_hf_pipeline(model_name: str, max_new_tokens: int):
+def load_hf_model_and_tokenizer(
+    model_name: str,
+    max_new_tokens: int,
+    use_lora: bool,
+    adapter_dir: Optional[Path] = None,
+):
     """
-    Load a local HF model on Apple Silicon (MPS if available, else CPU).
+    Load a local HF CausalLM model + tokenizer, optionally with LoRA adapters.
+    Designed to run on Apple Silicon (MPS) or CPU.
+
+    On Mac: set use_lora=True (LoRA) but use_qlora=False in finetuning (no bitsandbytes).
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Using device: {device}")
+    print(f"[run_llm_inference] Using device: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     model = AutoModelForCausalLM.from_pretrained(model_name)
 
+    if use_lora:
+        if adapter_dir is None:
+            raise ValueError("use_lora=True but no adapter_dir provided.")
+        from peft import PeftModel
+
+        print(f"[run_llm_inference] Loading LoRA adapters from: {adapter_dir}")
+        model = PeftModel.from_pretrained(model, str(adapter_dir))
+
+    # Move to device
+    if device == "mps":
+        model = model.to("mps")
+    else:
+        model = model.to("cpu")
+
+    # We can rely on model's device; pipeline will use it
     text_gen = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        device=device,
         max_new_tokens=max_new_tokens,
         temperature=0.0,
         top_p=1.0,
     )
-    return text_gen
+
+    return text_gen, tokenizer
 
 
 def choose_grouping_cols(df: pd.DataFrame) -> Tuple[List[str], bool]:
+    """
+    Decide how to group tokens for prompting.
+
+    If 'utterance_id' exists, group by (transcript_id, utterance_id).
+    Otherwise, group by transcript_id only.
+    """
     if "utterance_id" in df.columns:
         print("HF inference: grouping by (transcript_id, utterance_id).")
         return ["transcript_id", "utterance_id"], True
@@ -71,6 +105,10 @@ def choose_grouping_cols(df: pd.DataFrame) -> Tuple[List[str], bool]:
 @app.command()
 def main(
     config_path: Path = typer.Option(Path("config.yaml"), help="Config file."),
+    model_key: str = typer.Option(
+        "phi3-mini",
+        help="Key in config.yaml under 'models' to use for this run.",
+    ),
     mode: str = typer.Option(
         "z_shot_local",
         help="Prompting mode: z_shot_local | few_shot_local | few_shot_global",
@@ -79,13 +117,34 @@ def main(
         Path("results/raw/hf_local"),
         help="Root directory for raw HF model responses.",
     ),
+    use_lora: bool = typer.Option(
+        False,
+        help="If true, load LoRA adapters for this model (PEFT).",
+    ),
+    adapter_dir: Optional[Path] = typer.Option(
+        None,
+        help=(
+            "Directory containing LoRA adapters. "
+            "If not set and --use-lora is true, defaults to models/llm/<model_key>-ciu-lora."
+        ),
+    ),
     seed: int = typer.Option(2025, help="Random seed."),
 ) -> None:
+    """
+    Run a local Hugging Face LLM (optionally with LoRA) on the evaluation split and save raw outputs.
+
+    Prompts are built at utterance-level if 'utterance_id' exists; otherwise at transcript-level.
+    """
     set_global_seed(seed)
     cfg = Config.load(config_path)
 
-    model_name = cfg["llm"]["model_name"]
-    max_new_tokens = int(cfg["llm"].get("max_new_tokens", 2048))
+    model_cfg = get_model_config(cfg, model_key)
+    model_name = model_cfg["model_name"]
+    max_new_tokens = int(model_cfg.get("max_new_tokens", 2048))
+
+    if use_lora and adapter_dir is None:
+        adapter_dir = Path("models/llm") / f"{model_key}-ciu-lora"
+        print(f"[run_llm_inference] --use-lora set; defaulting adapter_dir to {adapter_dir}")
 
     prompts_dict = load_prompts_yaml(Path("prompts/ciu_prompts.yaml"))
     system_prompt = prompts_dict["system"]
@@ -101,14 +160,22 @@ def main(
 
     group_cols, has_utter = choose_grouping_cols(df)
 
-    model_basename = model_name.split("/")[-1]
-    out_dir = out_root / model_basename / mode
+    out_dir = out_root / model_key / mode
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    text_gen = load_hf_pipeline(model_name, max_new_tokens=max_new_tokens)
+    print(
+        f"[run_llm_inference] Running model_key='{model_key}' "
+        f"({model_name}) | mode={mode} | use_lora={use_lora}"
+    )
+    text_gen, _ = load_hf_model_and_tokenizer(
+        model_name=model_name,
+        max_new_tokens=max_new_tokens,
+        use_lora=use_lora,
+        adapter_dir=adapter_dir,
+    )
 
     for group_vals, g in tqdm(
-        df.groupby(group_cols), desc=f"Running HF LLM: {model_basename} | {mode}"
+        df.groupby(group_cols), desc=f"Running HF LLM: {model_key} | {mode}"
     ):
         if isinstance(group_vals, tuple):
             transcript_id = group_vals[0]
@@ -121,7 +188,8 @@ def main(
         token_block = build_token_block(tokens)
 
         group_id = (
-            f"{transcript_id}__utt-{utterance_id}" if has_utter and utterance_id is not None
+            f"{transcript_id}__utt-{utterance_id}"
+            if has_utter and utterance_id is not None
             else transcript_id
         )
 
@@ -129,7 +197,7 @@ def main(
             utterance_id=group_id,
             transcript_id=transcript_id,
             token_block=token_block,
-            few_shot_examples="",  # wire in examples later
+            few_shot_examples="",  # TODO: inject real examples later
         )
 
         prompt = (
@@ -148,12 +216,15 @@ def main(
                 "group_id": group_id,
                 "mode": mode,
                 "model_name": model_name,
+                "model_key": model_key,
+                "use_lora": use_lora,
+                "adapter_dir": str(adapter_dir) if adapter_dir is not None else None,
                 "response_text": gen,
             },
             out_dir / f"{group_id}.json",
         )
 
-    print(f"Completed HF inference. Outputs in {out_dir}")
+    print(f"[run_llm_inference] Completed. Outputs in {out_dir}")
 
 
 if __name__ == "__main__":

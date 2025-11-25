@@ -49,3 +49,10 @@ def save_json(obj: Any, path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         json.dump(obj, f, indent=2)
+
+
+def get_model_config(cfg: "Config", model_key: str) -> dict:
+    models = cfg["models"]
+    if model_key not in models:
+        raise KeyError(f"Unknown model_key '{model_key}'. Available: {list(models.keys())}")
+    return models[model_key]

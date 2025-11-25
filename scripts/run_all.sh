@@ -14,6 +14,7 @@ CONFIG_PATH="config.yaml"
 LABELED_CSV="data/labeled/ciu_tokens.csv"
 LABELED_PARQUET="data/labeled/ciu_tokens_normalized.parquet"
 
+# 1) Data prep & baselines (once)
 echo "=== Step 1: Normalize labeled tokens ==="
 python src/data_prep.py \
   --input-path "$LABELED_CSV" \
@@ -30,53 +31,52 @@ python src/train_baselines.py \
   --eval-ids-path data/splits/eval_ids.txt \
   --out-dir models/baselines
 
-echo "=== Step 4: Run local HF LLM inference (z_shot_local) ==="
-python src/run_llm_inference.py \
-  --config-path "$CONFIG_PATH" \
-  --mode z_shot_local \
-  --out-root results/raw/hf_local
+# 2) Model zoo loop
+MODEL_KEYS=("phi3-mini" "llama3-8b" "qwen2.5-7b")
 
-MODEL_BASENAME=$(python - << 'EOF'
-from utils import Config
-cfg = Config.load("config.yaml")
-print(cfg["llm"]["model_name"].split("/")[-1])
-EOF
-)
+for MODEL_KEY in "${MODEL_KEYS[@]}"; do
+  echo "======================================="
+  echo "Running pipeline for model_key: $MODEL_KEY"
+  echo "======================================="
 
-RAW_DIR_HF="results/raw/hf_local/${MODEL_BASENAME}/z_shot_local"
-MERGED_PARQUET="results/parsed/llm_predictions_${MODEL_BASENAME}_z_shot_local.parquet"
-METRICS_CSV="results/metrics/summary_${MODEL_BASENAME}_z_shot_local.csv"
+  echo "--- HF inference (z_shot_local) ---"
+  python src/run_llm_inference.py \
+    --config-path "$CONFIG_PATH" \
+    --model-key "$MODEL_KEY" \
+    --mode z_shot_local \
+    --out-root results/raw/hf_local
 
-echo "=== Step 5: Parse HF outputs and merge with labels ==="
-python src/parse_llm_outputs_hf.py \
-  --labeled-path "$LABELED_PARQUET" \
-  --raw-dir "$RAW_DIR_HF" \
-  --out-path "$MERGED_PARQUET"
+  RAW_DIR_HF="results/raw/hf_local/${MODEL_KEY}/z_shot_local"
+  MERGED_PARQUET="results/parsed/llm_predictions_${MODEL_KEY}_z_shot_local.parquet"
+  METRICS_CSV="results/metrics/summary_${MODEL_KEY}_z_shot_local.csv"
 
-echo "=== Step 6: Compute metrics for HF model ==="
-python src/compute_metrics.py \
-  --merged-path "$MERGED_PARQUET" \
-  --out-path "$METRICS_CSV"
+  echo "--- Parse HF outputs ---"
+  python src/parse_llm_outputs_hf.py \
+    --labeled-path "$LABELED_PARQUET" \
+    --raw-dir "$RAW_DIR_HF" \
+    --out-path "$MERGED_PARQUET"
 
-echo "=== Done. Metrics are in: $METRICS_CSV ==="
+  echo "--- Compute metrics ---"
+  python src/compute_metrics.py \
+    --merged-path "$MERGED_PARQUET" \
+    --out-path "$METRICS_CSV"
+
+  echo "Done for $MODEL_KEY. Metrics: $METRICS_CSV"
+done
 
 cat << 'NOTE'
 
 ---------------------------------------------------------
-Manual ChatGPT pipeline (not automated here)
+Manual ChatGPT pipeline (independent of model zoo)
 ---------------------------------------------------------
-
 1. Generate utterance-level prompts:
    python src/generate_chatgpt_prompts.py --mode z_shot_local
 
 2. For each .txt in results/prompts/chatgpt/z_shot_local/:
-   - Open file
-   - Paste SYSTEM MESSAGE into ChatGPT system field
-   - Paste USER MESSAGE into user field
-   - Copy ChatGPT JSON response into:
-     results/raw/chatgpt/z_shot_local/<same_group_id>.txt
+   - Paste SYSTEM/USER into ChatGPT
+   - Save JSON reply into results/raw/chatgpt/z_shot_local/<group_id>.txt
 
-3. Parse and evaluate ChatGPT:
+3. Parse & evaluate:
    python src/parse_llm_outputs_chatgpt.py \
      --labeled-path data/labeled/ciu_tokens_normalized.parquet \
      --raw-dir results/raw/chatgpt/z_shot_local \
@@ -89,3 +89,4 @@ Manual ChatGPT pipeline (not automated here)
      --out-path results/metrics/summary_chatgpt_z_shot_local.csv
 ---------------------------------------------------------
 NOTE
+

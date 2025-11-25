@@ -3,13 +3,43 @@ data:
   prompt_ids: data/splits/prompt_ids.txt
   eval_ids: data/splits/eval_ids.txt
 
-llm:
-  model_name: meta-llama/Llama-3.1-8B-Instruct   # adjust as needed
-  max_new_tokens: 2048
+models:
+  phi3-mini:
+    model_name: microsoft/Phi-3-mini-4k-instruct
+    max_new_tokens: 512
+    finetune:
+      use_qlora: false
+      max_seq_length: 1024
+      num_train_epochs: 3
+      batch_size: 2
+      learning_rate: 2e-4
 
-finetune:
-  use_qlora: false           # true only on a CUDA box
-  max_seq_length: 1024
-  num_train_epochs: 3
-  batch_size: 1
-  learning_rate: 2e-4
+  llama3-8b:
+    model_name: meta-llama/Llama-3.1-8B-Instruct
+    max_new_tokens: 1024
+    finetune:
+      use_qlora: false
+      max_seq_length: 768
+      num_train_epochs: 3
+      batch_size: 1
+      learning_rate: 2e-4
+
+  qwen2.5-7b:
+    model_name: Qwen/Qwen2.5-7B-Instruct
+    max_new_tokens: 1024
+    finetune:
+      use_qlora: false
+      max_seq_length: 768
+      num_train_epochs: 3
+      batch_size: 1
+      learning_rate: 2e-4
+
+  mistral-7b:
+    model_name: mistralai/Mistral-7B-Instruct-v0.3
+    max_new_tokens: 1024
+    finetune:
+      use_qlora: false
+      max_seq_length: 768
+      num_train_epochs: 3
+      batch_size: 1
+      learning_rate: 2e-4

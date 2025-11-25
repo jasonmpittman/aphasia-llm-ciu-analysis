@@ -8,6 +8,7 @@ __maintainer__ = "Jason M. Pittman"
 __status__ = "Research"
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -18,7 +19,7 @@ from datasets import Dataset
 from jinja2 import Template
 from tqdm import tqdm
 
-from utils import Config, set_global_seed
+from utils import Config, set_global_seed, get_model_config
 
 app = typer.Typer(add_completion=False)
 
@@ -37,6 +38,7 @@ class TrainConfig:
 
 def load_prompts_yaml(path: Path) -> Dict[str, str]:
     import yaml
+
     with path.open("r") as f:
         data = yaml.safe_load(f)
     system = data["system"]
@@ -50,6 +52,7 @@ def build_token_block(tokens: List[str]) -> str:
 
 def build_gold_json(tokens: List[str], word_labels: List[int], ciu_labels: List[int]) -> str:
     import json
+
     records = []
     for i, (tok, w, c) in enumerate(zip(tokens, word_labels, ciu_labels)):
         records.append(
@@ -64,6 +67,14 @@ def make_sft_examples(
     prompts_path: Path,
     mode: str = "z_shot_local",
 ) -> List[Dict[str, str]]:
+    """
+    Build SFT-style training examples at utterance or transcript level.
+
+    Input text format:
+      SYSTEM MESSAGE
+      USER MESSAGE
+      ASSISTANT MESSAGE (gold JSON labels)
+    """
     prompts_dict = load_prompts_yaml(prompts_path)
     system_prompt = prompts_dict["system"]
     user_template = Template(prompts_dict[mode])
@@ -73,10 +84,10 @@ def make_sft_examples(
 
     if "utterance_id" in df.columns:
         group_cols = ["transcript_id", "utterance_id"]
-        print("Finetuning grouping by (transcript_id, utterance_id)")
+        print("[finetune_llm] Grouping by (transcript_id, utterance_id)")
     else:
         group_cols = ["transcript_id"]
-        print("Finetuning grouping by transcript_id only")
+        print("[finetune_llm] Grouping by transcript_id only")
 
     examples: List[Dict[str, str]] = []
 
@@ -101,7 +112,7 @@ def make_sft_examples(
             utterance_id=group_id,
             transcript_id=transcript_id,
             token_block=token_block,
-            few_shot_examples="",
+            few_shot_examples="",  # could embed examples here too
         )
 
         gold_json = build_gold_json(tokens, word_labels, ciu_labels)
@@ -126,12 +137,12 @@ def make_sft_examples(
     return examples
 
 
-def get_train_config(cfg: Config, output_dir: Path, seed: int) -> TrainConfig:
-    llm = cfg["llm"]
-    ft = cfg.get("finetune", {})
+def get_train_config(cfg: Config, model_key: str, output_dir: Path, seed: int) -> TrainConfig:
+    model_cfg = get_model_config(cfg, model_key)
+    ft = model_cfg.get("finetune", {})
 
     return TrainConfig(
-        model_name=llm["model_name"],
+        model_name=model_cfg["model_name"],
         output_dir=output_dir,
         use_qlora=bool(ft.get("use_qlora", False)),
         max_seq_length=int(ft.get("max_seq_length", 1024)),
@@ -143,9 +154,15 @@ def get_train_config(cfg: Config, output_dir: Path, seed: int) -> TrainConfig:
 
 
 def load_model_and_tokenizer(train_cfg: TrainConfig):
+    """
+    Load base model + tokenizer, optionally with QLoRA setup.
+
+    On Apple Silicon (no CUDA), keep use_qlora=False and you'll get plain LoRA-style finetuning.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if train_cfg.use_qlora:
+        # QLoRA path (requires CUDA / bitsandbytes)
         from peft import LoraConfig, get_peft_model
         from transformers import BitsAndBytesConfig
 
@@ -169,13 +186,14 @@ def load_model_and_tokenizer(train_cfg: TrainConfig):
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "v_proj"],  # adjust if needed per architecture
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config)
     else:
+        # Standard LoRA-compatible load (no 4-bit)
         tokenizer = AutoTokenizer.from_pretrained(train_cfg.model_name, use_fast=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -206,6 +224,10 @@ def tokenize_dataset(dataset: Dataset, tokenizer, max_length: int) -> Dataset:
 @app.command()
 def main(
     config_path: Path = typer.Option(Path("config.yaml"), help="Config file."),
+    model_key: str = typer.Option(
+        "phi3-mini",
+        help="Key in config.yaml under 'models' to fine-tune.",
+    ),
     prompts_path: Path = typer.Option(
         Path("prompts/ciu_prompts.yaml"), help="YAML with CIU prompt templates."
     ),
@@ -218,16 +240,25 @@ def main(
         help="Transcript IDs used to build fine-tuning set.",
     ),
     mode: str = typer.Option(
-        "z_shot_local", help="Prompt template key to use for SFT examples."
+        "z_shot_local",
+        help="Prompt template key to use for SFT examples.",
     ),
     seed: int = typer.Option(2025, help="Random seed."),
 ) -> None:
+    """
+    Skeleton LoRA / QLoRA fine-tuning script.
+
+    - Builds SFT-style examples from prompt-support transcripts.
+    - Fine-tunes a causal LM with (Q)LoRA.
+    - Saves adapters under models/llm/<model_key>-ciu-lora/.
+    """
     set_global_seed(seed)
     cfg = Config.load(config_path)
 
     df = pd.read_parquet(labeled_path)
     prompt_ids = prompt_ids_path.read_text().splitlines()
 
+    print(f"[finetune_llm] Building SFT examples for model_key='{model_key}'")
     examples = make_sft_examples(
         df=df,
         prompt_ids=prompt_ids,
@@ -236,11 +267,14 @@ def main(
     )
     dataset = Dataset.from_pandas(pd.DataFrame(examples))
 
-    model_basename = cfg["llm"]["model_name"].split("/")[-1]
-    out_dir = Path("models/llm") / f"{model_basename}-ciu-lora"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    adapter_dir = Path("models/llm") / f"{model_key}-ciu-lora"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    train_cfg = get_train_config(cfg, out_dir, seed)
+    train_cfg = get_train_config(cfg, model_key, adapter_dir, seed)
+    print(
+        f"[finetune_llm] model_name={train_cfg.model_name}, "
+        f"use_qlora={train_cfg.use_qlora}, output_dir={adapter_dir}"
+    )
     model, tokenizer = load_model_and_tokenizer(train_cfg)
 
     tokenized = tokenize_dataset(dataset, tokenizer, train_cfg.max_seq_length)
@@ -253,7 +287,7 @@ def main(
     )
 
     training_args = TrainingArguments(
-        output_dir=str(out_dir),
+        output_dir=str(adapter_dir),
         per_device_train_batch_size=train_cfg.per_device_train_batch_size,
         num_train_epochs=train_cfg.num_train_epochs,
         learning_rate=train_cfg.learning_rate,
@@ -262,7 +296,7 @@ def main(
         save_strategy="epoch",
         seed=train_cfg.seed,
         gradient_checkpointing=True,
-        fp16=train_cfg.use_qlora,
+        fp16=train_cfg.use_qlora,  # ignored on CPU/MPS
     )
 
     trainer = Trainer(
@@ -275,10 +309,10 @@ def main(
 
     trainer.train()
 
-    model.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
+    model.save_pretrained(adapter_dir)
+    tokenizer.save_pretrained(adapter_dir)
 
-    print(f"Fine-tuned adapters saved to {out_dir}")
+    print(f"[finetune_llm] Fine-tuned adapters saved to {adapter_dir}")
 
 
 if __name__ == "__main__":
