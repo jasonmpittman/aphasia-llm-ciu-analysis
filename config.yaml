@@ -1,0 +1,15 @@
+data:
+  labeled_normalized: data/labeled/ciu_tokens_normalized.parquet
+  prompt_ids: data/splits/prompt_ids.txt
+  eval_ids: data/splits/eval_ids.txt
+
+llm:
+  model_name: meta-llama/Llama-3.1-8B-Instruct   # adjust as needed
+  max_new_tokens: 2048
+
+finetune:
+  use_qlora: false           # true only on a CUDA box
+  max_seq_length: 1024
+  num_train_epochs: 3
+  batch_size: 1
+  learning_rate: 2e-4
