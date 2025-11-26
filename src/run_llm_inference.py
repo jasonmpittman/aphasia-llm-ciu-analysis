@@ -17,7 +17,13 @@ import typer
 from jinja2 import Template
 from tqdm import tqdm
 
-from utils import Config, save_json, set_global_seed, get_model_config
+from utils import (
+    Config,
+    save_json,
+    set_global_seed,
+    get_model_config,
+    build_few_shot_block,
+)
 
 app = typer.Typer(add_completion=False)
 
@@ -45,8 +51,6 @@ def load_hf_model_and_tokenizer(
     """
     Load a local HF CausalLM model + tokenizer, optionally with LoRA adapters.
     Designed to run on Apple Silicon (MPS) or CPU.
-
-    On Mac: set use_lora=True (LoRA) but use_qlora=False in finetuning (no bitsandbytes).
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
@@ -68,13 +72,11 @@ def load_hf_model_and_tokenizer(
         print(f"[run_llm_inference] Loading LoRA adapters from: {adapter_dir}")
         model = PeftModel.from_pretrained(model, str(adapter_dir))
 
-    # Move to device
     if device == "mps":
         model = model.to("mps")
     else:
         model = model.to("cpu")
 
-    # We can rely on model's device; pipeline will use it
     text_gen = pipeline(
         "text-generation",
         model=model,
@@ -88,12 +90,6 @@ def load_hf_model_and_tokenizer(
 
 
 def choose_grouping_cols(df: pd.DataFrame) -> Tuple[List[str], bool]:
-    """
-    Decide how to group tokens for prompting.
-
-    If 'utterance_id' exists, group by (transcript_id, utterance_id).
-    Otherwise, group by transcript_id only.
-    """
     if "utterance_id" in df.columns:
         print("HF inference: grouping by (transcript_id, utterance_id).")
         return ["transcript_id", "utterance_id"], True
@@ -128,12 +124,16 @@ def main(
             "If not set and --use-lora is true, defaults to models/llm/<model_key>-ciu-lora."
         ),
     ),
+    n_few_shot: int = typer.Option(
+        3,
+        help="Number of few-shot examples to include when using few_shot_* modes.",
+    ),
     seed: int = typer.Option(2025, help="Random seed."),
 ) -> None:
     """
     Run a local Hugging Face LLM (optionally with LoRA) on the evaluation split and save raw outputs.
 
-    Prompts are built at utterance-level if 'utterance_id' exists; otherwise at transcript-level.
+    For modes starting with 'few_shot', a few-shot block is auto-generated from the prompt-support set.
     """
     set_global_seed(seed)
     cfg = Config.load(config_path)
@@ -152,16 +152,44 @@ def main(
 
     labeled_path = Path(cfg["data"]["labeled_normalized"])
     eval_ids_path = Path(cfg["data"]["eval_ids"])
+    prompt_ids_path = Path(cfg["data"]["prompt_ids"])
 
-    df = pd.read_parquet(labeled_path)
+    df_all = pd.read_parquet(labeled_path)
+
     eval_ids = set(eval_ids_path.read_text().splitlines())
-    df = df[df["transcript_id"].isin(eval_ids)].copy()
-    df = df.sort_values(["transcript_id", "token_index"]).reset_index(drop=True)
+    df_eval = df_all[df_all["transcript_id"].isin(eval_ids)].copy()
+    df_eval = df_eval.sort_values(["transcript_id", "token_index"]).reset_index(drop=True)
 
-    group_cols, has_utter = choose_grouping_cols(df)
+    group_cols, has_utter = choose_grouping_cols(df_eval)
 
+    # Output directory for this model+mode
     out_dir = out_root / model_key / mode
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build few-shot examples (and log which ones) if needed
+    few_shot_text = ""
+    if mode.startswith("few_shot") and prompt_ids_path.exists():
+        prompt_ids = prompt_ids_path.read_text().splitlines()
+        few_shot_text, few_shot_meta = build_few_shot_block(
+            df_all,
+            prompt_ids=prompt_ids,
+            n_examples=n_few_shot,
+            seed=seed,
+            group_by_utterance=True,
+        )
+        print(
+            f"[run_llm_inference] Built few-shot block with up to {n_few_shot} examples "
+            f"from prompt-support set."
+        )
+        if few_shot_meta:
+            save_json(
+                few_shot_meta,
+                out_dir / "few_shot_examples_metadata.json",
+            )
+            print(
+                f"[run_llm_inference] Logged few-shot metadata to "
+                f"{out_dir / 'few_shot_examples_metadata.json'}"
+            )
 
     print(
         f"[run_llm_inference] Running model_key='{model_key}' "
@@ -175,7 +203,7 @@ def main(
     )
 
     for group_vals, g in tqdm(
-        df.groupby(group_cols), desc=f"Running HF LLM: {model_key} | {mode}"
+        df_eval.groupby(group_cols), desc=f"Running HF LLM: {model_key} | {mode}"
     ):
         if isinstance(group_vals, tuple):
             transcript_id = group_vals[0]
@@ -197,7 +225,7 @@ def main(
             utterance_id=group_id,
             transcript_id=transcript_id,
             token_block=token_block,
-            few_shot_examples="",  # TODO: inject real examples later
+            few_shot_examples=few_shot_text,
         )
 
         prompt = (

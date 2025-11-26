@@ -8,6 +8,7 @@ __maintainer__ = "Jason M. Pittman"
 __status__ = "Research"
 
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -16,13 +17,14 @@ import typer
 from jinja2 import Template
 from tqdm import tqdm
 
-from utils import Config, set_global_seed
+from utils import Config, set_global_seed, build_few_shot_block, save_json
 
 app = typer.Typer(add_completion=False)
 
 
 def load_prompts_yaml(path: Path) -> Dict[str, str]:
     import yaml
+
     with path.open("r") as f:
         data = yaml.safe_load(f)
     system = data["system"]
@@ -35,12 +37,6 @@ def build_token_block(tokens: List[str]) -> str:
 
 
 def choose_grouping_cols(df: pd.DataFrame) -> Tuple[List[str], bool]:
-    """
-    Decide how to group tokens for prompting.
-
-    If 'utterance_id' exists, group by (transcript_id, utterance_id).
-    Otherwise, group by transcript_id only.
-    """
     if "utterance_id" in df.columns:
         print("ChatGPT prompts: grouping by (transcript_id, utterance_id).")
         return ["transcript_id", "utterance_id"], True
@@ -60,11 +56,18 @@ def main(
         Path("results/prompts/chatgpt"),
         help="Where to save prompt text files.",
     ),
+    n_few_shot: int = typer.Option(
+        3,
+        help="Number of few-shot examples to include when using few_shot_* modes.",
+    ),
     seed: int = typer.Option(2025, help="Random seed."),
 ) -> None:
     """
     Generate one prompt text file per utterance (if available) or per transcript,
     for manual use in the ChatGPT web UI.
+
+    For modes starting with 'few_shot', a few-shot block is auto-generated from the
+    prompt-support set and logged with metadata.
     """
     set_global_seed(seed)
     cfg = Config.load(config_path)
@@ -75,18 +78,45 @@ def main(
 
     labeled_path = Path(cfg["data"]["labeled_normalized"])
     eval_ids_path = Path(cfg["data"]["eval_ids"])
+    prompt_ids_path = Path(cfg["data"]["prompt_ids"])
 
-    df = pd.read_parquet(labeled_path)
+    df_all = pd.read_parquet(labeled_path)
+
     eval_ids = set(eval_ids_path.read_text().splitlines())
-    df = df[df["transcript_id"].isin(eval_ids)].copy()
-    df = df.sort_values(["transcript_id", "token_index"]).reset_index(drop=True)
+    df_eval = df_all[df_all["transcript_id"].isin(eval_ids)].copy()
+    df_eval = df_eval.sort_values(["transcript_id", "token_index"]).reset_index(drop=True)
 
-    group_cols, has_utter = choose_grouping_cols(df)
+    group_cols, has_utter = choose_grouping_cols(df_eval)
 
     out_mode_dir = out_dir / mode
     out_mode_dir.mkdir(parents=True, exist_ok=True)
 
-    for group_vals, g in tqdm(df.groupby(group_cols), desc="Generating ChatGPT prompts"):
+    # Few-shot block + metadata
+    few_shot_text = ""
+    if mode.startswith("few_shot") and prompt_ids_path.exists():
+        prompt_ids = prompt_ids_path.read_text().splitlines()
+        few_shot_text, few_shot_meta = build_few_shot_block(
+            df_all,
+            prompt_ids=prompt_ids,
+            n_examples=n_few_shot,
+            seed=seed,
+            group_by_utterance=True,
+        )
+        print(
+            f"[generate_chatgpt_prompts] Built few-shot block with up to {n_few_shot} examples "
+            f"from prompt-support set."
+        )
+        if few_shot_meta:
+            save_json(
+                few_shot_meta,
+                out_mode_dir / "few_shot_examples_metadata.json",
+            )
+            print(
+                "[generate_chatgpt_prompts] Logged few-shot metadata to "
+                f"{out_mode_dir / 'few_shot_examples_metadata.json'}"
+            )
+
+    for group_vals, g in tqdm(df_eval.groupby(group_cols), desc="Generating ChatGPT prompts"):
         if isinstance(group_vals, tuple):
             transcript_id = group_vals[0]
             utterance_id = group_vals[1] if len(group_vals) > 1 else None
@@ -98,7 +128,8 @@ def main(
         token_block = build_token_block(tokens)
 
         group_id = (
-            f"{transcript_id}__utt-{utterance_id}" if has_utter and utterance_id is not None
+            f"{transcript_id}__utt-{utterance_id}"
+            if has_utter and utterance_id is not None
             else transcript_id
         )
 
@@ -106,7 +137,7 @@ def main(
             utterance_id=group_id,
             transcript_id=transcript_id,
             token_block=token_block,
-            few_shot_examples="",  # wire in examples later if you want
+            few_shot_examples=few_shot_text,
         )
 
         prompt_text = (
@@ -118,7 +149,7 @@ def main(
 
         (out_mode_dir / f"{group_id}.txt").write_text(prompt_text)
 
-    print(f"ChatGPT prompts written to {out_mode_dir}")
+    print(f"[generate_chatgpt_prompts] Prompts written to {out_mode_dir}")
 
 
 if __name__ == "__main__":
