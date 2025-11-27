@@ -1,4 +1,6 @@
 # src/parse_llm_outputs_chatgpt.py
+from __future__ import annotations
+
 __author__ = "Jason M. Pittman"
 __copyright__ = "Copyright 2025"
 __credits__ = ["Jason M. Pittman"]
@@ -11,7 +13,6 @@ __status__ = "Research"
 Parse manual ChatGPT outputs (plain text files with JSON arrays) and merge with ground-truth.
 """
 
-from __future__ import annotations
 import json
 from pathlib import Path
 from typing import List

@@ -1,4 +1,6 @@
 # src/data_prep.py
+from __future__ import annotations
+
 __author__ = "Jason M. Pittman"
 __copyright__ = "Copyright 2025"
 __credits__ = ["Jason M. Pittman"]
@@ -14,7 +16,6 @@ Input:  data/labeled/ciu_tokens.csv
 Output: data/labeled/ciu_tokens_normalized.parquet
 """
 
-from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd

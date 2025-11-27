@@ -1,4 +1,6 @@
 # src/run_llm_inference.py
+from __future__ import annotations
+
 __author__ = "Jason M. Pittman"
 __copyright__ = "Copyright 2025"
 __credits__ = ["Jason M. Pittman"]
@@ -6,8 +8,6 @@ __license__ = "Apache License 2.0"
 __version__ = "0.1.0"
 __maintainer__ = "Jason M. Pittman"
 __status__ = "Research"
-
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional

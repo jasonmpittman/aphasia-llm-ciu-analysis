@@ -1,4 +1,6 @@
 # src/train_baselines.py
+from __future__ import annotations
+
 __author__ = "Jason M. Pittman"
 __copyright__ = "Copyright 2025"
 __credits__ = ["Jason M. Pittman"]
@@ -11,7 +13,6 @@ __status__ = "Research"
 Train classic ML baselines for CIU vs NON-CIU on token-level features.
 """
 
-from __future__ import annotations
 from pathlib import Path
 
 import joblib

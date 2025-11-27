@@ -1,4 +1,6 @@
 # src/parse_llm_outputs_hf.py
+from __future__ import annotations
+
 __author__ = "Jason M. Pittman"
 __copyright__ = "Copyright 2025"
 __credits__ = ["Jason M. Pittman"]
@@ -11,7 +13,6 @@ __status__ = "Research"
 Parse HF LLM outputs (JSON wrapper files) and merge with ground-truth labels.
 """
 
-from __future__ import annotations
 import json
 from pathlib import Path
 from typing import List
