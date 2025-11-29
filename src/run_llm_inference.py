@@ -82,7 +82,7 @@ def load_hf_model_and_tokenizer(
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
-        temperature=0.0,
+        temperature=0.001,
         top_p=1.0,
     )
 
