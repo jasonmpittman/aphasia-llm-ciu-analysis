@@ -9,148 +9,279 @@ __version__ = "0.1.0"
 __maintainer__ = "Jason M. Pittman"
 __status__ = "Research"
 
+"""
+Generate prompts for running CIU labeling experiments with ChatGPT (web UI).
+
+Supports:
+  - Zero-shot prompts (mode='z_shot'): instructions + TARGET utterance only.
+  - Few-shot prompts (mode='few_shot'): instructions + K EXAMPLE utterances
+    (with gold labels) + TARGET utterance.
+
+For each eval transcript_id, writes a .txt file you can paste directly
+into the ChatGPT UI.
+
+Default I/O:
+  - Labeled data: data/labeled/ciu_tokens_normalized.parquet
+  - Prompt-support IDs: data/splits/prompt_ids.txt
+  - Eval IDs: data/splits/eval_ids.txt
+  - Output directory: prompts/chatgpt/<mode>/*.txt
+"""
+
+import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List
 
 import pandas as pd
 import typer
-from jinja2 import Template
-from tqdm import tqdm
 
-from utils import Config, set_global_seed, build_few_shot_block, save_json
+from utils import set_global_seed
 
 app = typer.Typer(add_completion=False)
 
 
-def load_prompts_yaml(path: Path) -> Dict[str, str]:
-    import yaml
+INSTRUCTIONS = """You are an expert speech-language pathologist performing Correct Information Unit (CIU) analysis
+following Nicholas & Brookshire (1993). You receive pre-tokenized utterances from a clinical
+picture description task. Each token is a single word. For each token, you must decide if it is:
+(1) a WORD (intelligible lexical item) or NOT WORD; and
+(2) if WORD, whether it is a Correct Information Unit (CIU).
 
-    with path.open("r") as f:
-        data = yaml.safe_load(f)
-    system = data["system"]
-    prompts = data["prompts"]
-    return {"system": system, **prompts}
+A CIU is a single WORD that is accurate, relevant, and informative about the pictured scene, and
+understandable in context. Fillers ("uh", "um"), repetitions, false starts, and off-topic words are
+NOT CIUs.
+
+You will see:
+- (Optionally) one or more EXAMPLE utterances with their correct labels.
+- Then a TARGET utterance to label.
+
+For each utterance, tokens are shown as:
+index: token
+
+You MUST output labels for the TARGET utterance ONLY, in the following JSON format:
+
+[
+  {
+    "index": 0,
+    "token": "the",
+    "word_label": 1,
+    "ciu_label": 0
+  },
+  ...
+]
+
+Where:
+- index is the integer token index
+- token is exactly the token string as given (case-sensitive, do not normalize or change it)
+- word_label is 1 if the token is an intelligible WORD, else 0
+- ciu_label is 1 if and only if:
+    * word_label == 1, and
+    * the word is accurate about the scene,
+    * relevant (on-topic and adds information),
+    * understandable in context
+  otherwise ciu_label is 0
+
+Important formatting rules:
+- Output a SINGLE JSON array.
+- Do NOT include any explanation, commentary, or additional text.
+- Do NOT include keys other than "index", "token", "word_label", "ciu_label".
+- The array MUST contain one object per token in the TARGET utterance, in order.
+""".strip()
 
 
-def build_token_block(tokens: List[str]) -> str:
-    return "\n".join(f"{i}: {tok}" for i, tok in enumerate(tokens))
+def load_id_list(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"ID file not found: {path}")
+    ids = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    return ids
 
 
-def choose_grouping_cols(df: pd.DataFrame) -> Tuple[List[str], bool]:
-    if "utterance_id" in df.columns:
-        print("ChatGPT prompts: grouping by (transcript_id, utterance_id).")
-        return ["transcript_id", "utterance_id"], True
-    else:
-        print("ChatGPT prompts: no 'utterance_id'; grouping by transcript_id only.")
-        return ["transcript_id"], False
+def format_tokens_block(df_sub: pd.DataFrame) -> str:
+    """Render a 'Tokens:' block as:
+       0: token0
+       1: token1
+       ...
+    """
+    lines = []
+    for _, row in df_sub.sort_values("token_index").iterrows():
+        idx = int(row["token_index"])
+        tok = str(row["token_text"])
+        lines.append(f"{idx}: {tok}")
+    return "\n".join(lines)
+
+
+def format_labels_json(df_sub: pd.DataFrame) -> str:
+    """Render gold labels as a pretty-printed JSON array."""
+    records = []
+    for _, row in df_sub.sort_values("token_index").iterrows():
+        records.append(
+            {
+                "index": int(row["token_index"]),
+                "token": str(row["token_text"]),
+                "word_label": int(row["word_label"]),
+                "ciu_label": int(row["ciu_label"]),
+            }
+        )
+    return json.dumps(records, indent=2, ensure_ascii=False)
 
 
 @app.command()
 def main(
-    config_path: Path = typer.Option(Path("config.yaml"), help="Config file."),
-    mode: str = typer.Option(
-        "z_shot_local",
-        help="Prompting mode: z_shot_local | few_shot_local | few_shot_global",
+    labeled_path: Path = typer.Option(
+        Path("data/labeled/ciu_tokens_normalized.parquet"),
+        help="Gold labeled tokens parquet.",
+    ),
+    prompt_ids_path: Path = typer.Option(
+        Path("data/splits/prompt_ids.txt"),
+        help="File with transcript_ids for prompt-support (few-shot examples).",
+    ),
+    eval_ids_path: Path = typer.Option(
+        Path("data/splits/eval_ids.txt"),
+        help="File with transcript_ids for evaluation (targets).",
     ),
     out_dir: Path = typer.Option(
-        Path("results/prompts/chatgpt"),
-        help="Where to save prompt text files.",
+        Path("prompts/chatgpt"),
+        help="Base output directory for prompts.",
     ),
-    n_few_shot: int = typer.Option(
-        3,
-        help="Number of few-shot examples to include when using few_shot_* modes.",
+    mode: str = typer.Option(
+        "z_shot",
+        help="Prompt mode: 'z_shot' (no examples) or 'few_shot' (with examples).",
     ),
-    seed: int = typer.Option(2025, help="Random seed."),
+    n_examples: int = typer.Option(
+        2,
+        help="Number of example utterances to include in few-shot mode (max = #prompt_ids).",
+    ),
+    seed: int = typer.Option(
+        2025,
+        help="Random seed for selecting example transcripts.",
+    ),
 ) -> None:
     """
-    Generate one prompt text file per utterance (if available) or per transcript,
-    for manual use in the ChatGPT web UI.
+    Generate ChatGPT prompts for CIU labeling experiments.
 
-    For modes starting with 'few_shot', a few-shot block is auto-generated from the
-    prompt-support set and logged with metadata.
+    One .txt file per eval transcript_id is written to:
+      out_dir / mode / <transcript_id>.txt
     """
+    mode = mode.strip().lower()
+    if mode not in {"z_shot", "few_shot"}:
+        raise ValueError("mode must be 'z_shot' or 'few_shot'.")
+
     set_global_seed(seed)
-    cfg = Config.load(config_path)
 
-    prompts_dict = load_prompts_yaml(Path("prompts/ciu_prompts.yaml"))
-    system_prompt = prompts_dict["system"]
-    user_template = Template(prompts_dict[mode])
+    # Load labeled data
+    df = pd.read_parquet(labeled_path)
 
-    labeled_path = Path(cfg["data"]["labeled_normalized"])
-    eval_ids_path = Path(cfg["data"]["eval_ids"])
-    prompt_ids_path = Path(cfg["data"]["prompt_ids"])
+    # Basic sanity
+    required_cols = {"transcript_id", "token_index", "token_text", "word_label", "ciu_label"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Labeled data missing required columns: {missing}")
 
-    df_all = pd.read_parquet(labeled_path)
+    # Load ID lists
+    eval_ids = load_id_list(eval_ids_path)
 
-    eval_ids = set(eval_ids_path.read_text().splitlines())
-    df_eval = df_all[df_all["transcript_id"].isin(eval_ids)].copy()
-    df_eval = df_eval.sort_values(["transcript_id", "token_index"]).reset_index(drop=True)
+    if not eval_ids:
+        raise ValueError(f"No eval_ids found in {eval_ids_path}")
 
-    group_cols, has_utter = choose_grouping_cols(df_eval)
+    prompt_ids: List[str] = []
+    example_ids: List[str] = []
 
-    out_mode_dir = out_dir / mode
-    out_mode_dir.mkdir(parents=True, exist_ok=True)
+    if mode == "few_shot":
+        prompt_ids = load_id_list(prompt_ids_path)
+        if not prompt_ids:
+            raise ValueError(
+                f"few_shot mode requested but no prompt_ids found in {prompt_ids_path}"
+            )
+        if n_examples <= 0:
+            raise ValueError("n_examples must be >= 1 for few_shot mode.")
 
-    # Few-shot block + metadata
-    few_shot_text = ""
-    if mode.startswith("few_shot") and prompt_ids_path.exists():
-        prompt_ids = prompt_ids_path.read_text().splitlines()
-        few_shot_text, few_shot_meta = build_few_shot_block(
-            df_all,
-            prompt_ids=prompt_ids,
-            n_examples=n_few_shot,
-            seed=seed,
-            group_by_utterance=True,
-        )
+        # Choose a fixed set of example transcripts for all prompts (simpler & reproducible)
+        import random
+
+        n_examples_eff = min(n_examples, len(prompt_ids))
+        example_ids = random.sample(prompt_ids, k=n_examples_eff)
         print(
-            f"[generate_chatgpt_prompts] Built few-shot block with up to {n_few_shot} examples "
-            f"from prompt-support set."
+            f"[generate_chatgpt_prompts] few_shot mode: using {n_examples_eff} example transcripts: "
+            + ", ".join(example_ids)
         )
-        if few_shot_meta:
-            save_json(
-                few_shot_meta,
-                out_mode_dir / "few_shot_examples_metadata.json",
+
+    # Prepare output directory
+    mode_dir = out_dir / mode
+    mode_dir.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"[generate_chatgpt_prompts] Generating prompts for mode='{mode}' "
+        f"into {mode_dir} for {len(eval_ids)} eval transcripts."
+    )
+
+    # Pre-slice per transcript for efficiency
+    grouped = {tid: g.copy() for tid, g in df.groupby("transcript_id")}
+
+    # Pre-build example blocks (once) for few_shot
+    example_blocks: List[str] = []
+    if mode == "few_shot":
+        for i, ex_tid in enumerate(example_ids, start=1):
+            if ex_tid not in grouped:
+                print(
+                    f"[generate_chatgpt_prompts] WARNING: example transcript_id '{ex_tid}' "
+                    "not found in labeled data; skipping."
+                )
+                continue
+
+            df_ex = grouped[ex_tid]
+            ex_tokens_block = format_tokens_block(df_ex)
+            ex_labels_json = format_labels_json(df_ex)
+
+            block = (
+                "----------------\n"
+                f"EXAMPLE UTTERANCE {i}\n"
+                f"Example Utterance ID: {ex_tid}\n\n"
+                "Tokens:\n"
+                f"{ex_tokens_block}\n\n"
+                "Labels:\n"
+                f"{ex_labels_json}\n"
             )
+            example_blocks.append(block)
+
+    # Generate one prompt per eval transcript
+    for tid in eval_ids:
+        if tid not in grouped:
             print(
-                "[generate_chatgpt_prompts] Logged few-shot metadata to "
-                f"{out_mode_dir / 'few_shot_examples_metadata.json'}"
+                f"[generate_chatgpt_prompts] WARNING: eval transcript_id '{tid}' "
+                "not found in labeled data; skipping."
             )
+            continue
 
-    for group_vals, g in tqdm(df_eval.groupby(group_cols), desc="Generating ChatGPT prompts"):
-        if isinstance(group_vals, tuple):
-            transcript_id = group_vals[0]
-            utterance_id = group_vals[1] if len(group_vals) > 1 else None
-        else:
-            transcript_id = group_vals
-            utterance_id = None
+        df_tgt = grouped[tid]
+        tgt_tokens_block = format_tokens_block(df_tgt)
 
-        tokens = g["token_text"].tolist()
-        token_block = build_token_block(tokens)
+        parts: List[str] = []
+        parts.append(INSTRUCTIONS)
 
-        group_id = (
-            f"{transcript_id}__utt-{utterance_id}"
-            if has_utter and utterance_id is not None
-            else transcript_id
+        # Few-shot examples (if any)
+        if mode == "few_shot" and example_blocks:
+            parts.append("\n")
+            parts.extend(example_blocks)
+
+        # Target block
+        target_block = (
+            "----------------\n"
+            "TARGET UTTERANCE\n"
+            f"Utterance ID: {tid}\n\n"
+            "Tokens:\n"
+            f"{tgt_tokens_block}\n\n"
+            f"Now, using the exact same rules and output format, output ONLY the JSON array of labels\n"
+            f"for the TARGET utterance (Utterance ID: {tid}).\n"
+            "Remember: no explanations, just the JSON array.\n"
         )
+        parts.append(target_block)
 
-        rendered_user = user_template.render(
-            utterance_id=group_id,
-            transcript_id=transcript_id,
-            token_block=token_block,
-            few_shot_examples=few_shot_text,
-        )
+        prompt_text = "\n".join(parts).strip() + "\n"
 
-        prompt_text = (
-            "SYSTEM MESSAGE:\n"
-            f"{system_prompt}\n\n"
-            "USER MESSAGE:\n"
-            f"{rendered_user}\n"
-        )
+        out_path = mode_dir / f"{tid}.txt"
+        out_path.write_text(prompt_text, encoding="utf-8")
 
-        (out_mode_dir / f"{group_id}.txt").write_text(prompt_text)
-
-    print(f"[generate_chatgpt_prompts] Prompts written to {out_mode_dir}")
+    print("[generate_chatgpt_prompts] Done.")
 
 
 if __name__ == "__main__":
     app()
+
