@@ -3,6 +3,7 @@ data:
   prompt_ids: data/splits/prompt_ids.txt
   eval_ids: data/splits/eval_ids.txt
 
+# configuration for inference on base hf models
 models:
   phi3-mini:
     model_name: microsoft/Phi-3-mini-4k-instruct
@@ -43,3 +44,20 @@ models:
       num_train_epochs: 3
       batch_size: 1
       learning_rate: 2e-4
+
+# fine-tuned variants
+  phi3-mini-ciu-ft:
+    model_name: models/llm/phi3-mini-ciu-lora
+    max_new_tokens: 512
+
+  llama3-8b-ciu-ft:
+    model_name: models/llm/llama3-8b-ciu-lora
+    max_new_tokens: 1024
+
+  qwen2.5-7b-ciu-ft:
+    model_name: models/llm/qwen2.5-7b-ciu-lora
+    max_new_tokens: 1024
+
+  mistral-7b-ciu-ft:
+    model_name: models/llm/mistral-7b-ciu-lora
+    max_new_tokens: 1024
